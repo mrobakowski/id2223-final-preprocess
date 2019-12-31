@@ -1,6 +1,7 @@
 package se.kth.id2223.finalproject
 
-import java.nio.file.{Files, Paths}
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.{FileVisitResult, Files, Path, Paths, SimpleFileVisitor}
 
 import geotrellis.proj4.LatLng
 import geotrellis.raster.io.geotiff.MultibandGeoTiff
@@ -36,6 +37,8 @@ object RoofMaterial {
 
   case object Other extends RoofMaterial
 
+  val ALL: Array[RoofMaterial] = Array(Incomplete, ConcreteCement, IrregularMetal, HealthyMetal, Other)
+
   implicit val decoder: Decoder[RoofMaterial] = Decoder.decodeString.emap {
     case "incomplete" => Right(Incomplete)
     case "concrete_cement" => Right(ConcreteCement)
@@ -54,32 +57,62 @@ object Properties {
 
 object Main {
   def main(args: Array[String]): Unit = {
-    val image = GeoTiffReader.readMultiband("stac-data/stac/colombia/borde_rural/borde_rural_ortho-cog.tif", streaming = true)
-    val json = GeoJson.fromFile[JsonFeatureCollection]("stac-data/stac/colombia/borde_rural/train-borde_rural.geojson")
-    val features = json.getAllFeatures[Feature[Geometry, Properties]]
-
-    // Streaming GeoTiff is not thread-safe, so this has to be done on one thread, sadly...
-    // TODO: maybe let's have every thread access a thread-local image???
-    ProgressBar.wrap(features.asJava, "extracting images").forEach { feature =>
-      extractFeatureFromImage(feature, image)
+    val (input, output) = args match {
+      case Array(input, output) => (input, output)
+      case Array(input) => (input, "output")
+      case Array() => ("stac-data/stac", "output")
     }
 
-    extractFeatureFromImage(features(0), image)
+    RoofMaterial.ALL.foreach { rm =>
+      Files.createDirectories(Paths.get(output, rm.toString))
+    }
+
+    Files.walkFileTree(Paths.get(input), new SimpleFileVisitor[Path] {
+      override def preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult = {
+        val pathsInDir = Files.list(dir).iterator().asScala.toList
+        val tiffFile = pathsInDir.collectFirst { case path if path.toString.endsWith(".tif") => path }
+        val trainGeoJsonFile = pathsInDir.collectFirst {
+          case path if path.getFileName.toString.startsWith("train-") && path.toString.endsWith(".geojson") => path
+        }
+
+        var found = false
+
+        tiffFile.zip(trainGeoJsonFile).foreach { case (tiff, geoJson) =>
+          processGeoTiff(tiff.toString, geoJson.toString, output)
+          found = true
+        }
+
+        if (found) FileVisitResult.SKIP_SUBTREE else FileVisitResult.CONTINUE
+      }
+    })
   }
 
-  def extractFeatureFromImage(feature: Feature[Geometry, Properties], image: MultibandGeoTiff) = {
+  def processGeoTiff(imagePath: String, geoJsonPath: String, outputDirectory: String): Unit = {
+    val dirName = Paths.get(imagePath).getParent.toString
+
+    // streaming GeoTiffs are not thread-safe, so each thread gets its own copy
+    val image = ThreadLocal.withInitial[MultibandGeoTiff](() => GeoTiffReader.readMultiband(imagePath, streaming = true))
+    val json = GeoJson.fromFile[JsonFeatureCollection](geoJsonPath)
+    val features = json.getAllFeatures[Feature[Geometry, Properties]]
+
+    println(f"processing $dirName")
+    val pb = new ProgressBar(f"extracting features", features.size)
+
+    features.par.foreach { feature =>
+      saveFeatureAsSeparatePng(feature, image.get(), outputDirectory)
+      pb.step()
+    }
+
+    pb.close()
+  }
+
+  def saveFeatureAsSeparatePng(feature: Feature[Geometry, Properties], image: MultibandGeoTiff, outputDirectory: String): Unit = {
     val Properties(_, material, id) = feature.data
     val extentInFeatureCoords: Extent = feature.geom.getEnvelopeInternal
     // the coordinate system of the features is geographical latitude and longitude
     val extentInImageCoords = extentInFeatureCoords.reproject(LatLng, image.crs)
     val croppedImage = image.crop(extentInImageCoords)
 
-    try {
-      Files.createDirectories(Paths.get("output", material.toString))
-    } catch {
-      case _: Throwable => ()
-    }
-
-    croppedImage.tile.renderPng().write(s"output/$material/$id.png")
+    croppedImage.tile.renderPng().write(s"$outputDirectory/$material/$id.png")
   }
 }
