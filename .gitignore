@@ -8,3 +8,4 @@
 /stac-data
 /test-output
 .DS_Store
+.ipynb_checkpoints
